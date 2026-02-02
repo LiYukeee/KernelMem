@@ -1,0 +1,6 @@
+[Launch-and-attach]
+--launch-skip=2
+--launch-count=3
+--csv
+--section=Occupancy,MemoryWorkloadAnalysis,ComputeWorkloadAnalysis,SpeedOfLight,WarpStateStats,SchedulerStats,SourceCounters
+--target-processes=all
