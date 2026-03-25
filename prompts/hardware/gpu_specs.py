@@ -5,6 +5,24 @@ A List of GPU Specs to include in the prompt
 
 
 GPU_SPEC_INFO = {
+
+    "RTX5090": {
+        "GPU Architecture": "Blackwell (GB202)",
+        "GPU Memory": "32GB GDDR7",
+        "Memory Bandwidth": "1792 GB/s",
+        "FP32 TFLOPS": "104.8",
+        "TF32 Tensor Core TFLOPS": "209.6 (419.2 with sparsity)",
+        "BFLOAT16 Tensor Core TFLOPS": "419.2 (838.4 with sparsity)",
+        "FP16 Tensor Core TFLOPS": "419.2 (838.4 with sparsity)",
+        "FP8 Tensor Core TFLOPS": "838.4 (1676.8 with sparsity)",
+        "INT8 Tensor Core TOPS": "838.4 (1676.8 with sparsity)",
+        "Register File Size": "64K 32-bit registers per SM",
+        "Maximum number of registers per thread": "255",
+        "Maximum number of thread blocks per SM": "24",
+        "Shared memory capacity per SM": "100 KB",
+        "Maximum shared memory per thread block": "99 KB",
+    },
+
     "L40S": {
         "GPU Architecture": "Ada",
         "GPU Memory": "48GB GDDR6 with ECC",

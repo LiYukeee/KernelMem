@@ -12,6 +12,7 @@ SGLANG_KEY = os.environ.get("SGLANG_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
 FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
+GITEEAI_API_KEY = os.environ.get("GITEEAI_API_KEY")
 
 endpoint = os.getenv("AZURE_API_ENDPOINT")
 deployment_name = os.getenv("DEPLOYMENT_NAME")
@@ -148,6 +149,17 @@ def query_server(
         case "sambanova":
             from openai import OpenAI
             client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
+            model = model_name
+
+        case "giteeai":
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=GITEEAI_API_KEY,
+                base_url="https://ai.gitee.com/v1",
+                default_headers={"X-Failover-Enabled": "true"},
+                timeout=10000000,
+                max_retries=3,
+            )
             model = model_name
 
         case "openai":
@@ -313,6 +325,10 @@ def query_server(
                 )
             )
         else:
+            extra_kwargs = {}
+            if server_type == "giteeai":
+                extra_kwargs["extra_body"] = {"top_k": top_k}
+                extra_kwargs["frequency_penalty"] = 1.1
             response = retry_with_backoff(
                 lambda: client.chat.completions.create(
                     model=model,
@@ -321,6 +337,7 @@ def query_server(
                     n=num_completions,
                     max_tokens=max_tokens,
                     top_p=top_p,
+                    **extra_kwargs,
                 )
             )
         outputs = []
