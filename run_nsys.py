@@ -61,7 +61,7 @@ def profile_bench(
     bench_py: str = "bench_ref_inputs.py",
     kernel_names: Optional[List[str]] = None,
     kernel_file: Optional[Union[str, Path]] = None,
-    conda_bin: str = "/root/miniconda3/envs/CudaForge/bin",
+    conda_bin: str = "/home/liyk/miniconda3/envs/CudaForge/bin",
     out_rep: Union[str, Path] = "nsys_temp.nsys-rep",
     device_idx: Optional[int] = None,
     timeout: int = 300,  # 5 minutes default timeout
@@ -81,7 +81,7 @@ def profile_bench(
     Returns:
         Path to generated .nsys-rep file
     """
-    nsys_bin = "nsys"  # Assume nsys is in PATH
+    nsys_bin = "/usr/local/cuda-12.8/bin/nsys"  # Full path to nsys
     rep_path = Path(out_rep).resolve()
     
     # Remove existing file if force-overwrite

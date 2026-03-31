@@ -1,3 +1,6 @@
 __pycache__
 .vscode/
 run/
+*.csv
+*.nsys-rep
+*.sqlite

@@ -136,13 +136,13 @@ def profile_bench(
     bench_py: str = "bench_ref_inputs.py",
     kernel_names: Optional[List[str]] = None,
     kernel_file: Optional[Union[str, Path]] = None,  # New: explicitly specify which kernel file to profile
-    conda_bin: str = "/root/miniconda3/envs/CudaForge/bin",
+    conda_bin: str = "/home/liyk/miniconda3/envs/CudaForge/bin",
     out_csv: Union[str, Path] = "ncu_temp.csv",
     repeat: int = 10,
     device_idx: Optional[int] = None,
     timeout_override: Optional[int] = None,  # New: override timeout for specific tasks (in seconds)
 ) -> Path:
-    ncu_bin = "/root/miniconda3/envs/robust_kbench/bin/ncu"
+    ncu_bin = "/usr/local/cuda-12.8/bin/ncu"
     csv_path = Path(out_csv).resolve()
 
     env = os.environ.copy()
@@ -159,9 +159,10 @@ def profile_bench(
     # tmp_ext = tempfile.mkdtemp(prefix="torch_ext_")
     # env["TORCH_EXTENSIONS_DIR"] = tmp_ext
 
-    # 配置文件路径
-    config_metrics = '/root/KernelMem/config_metrics.ncu-cfg'
-    config_section = '/root/KernelMem/config_section.ncu-cfg'
+    # 配置文件路径（相对于本文件所在目录）
+    _here = Path(__file__).resolve().parent
+    config_metrics = str(_here / 'config_metrics.ncu-cfg')
+    config_section = str(_here / 'config_section.ncu-cfg')
     
     # 解析 kernel_file 参数
     kernel_file_path = None
