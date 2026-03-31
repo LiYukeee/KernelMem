@@ -677,8 +677,77 @@ machine_check:
           gate_when: "tc_eligible = true AND (is_naive_gemm = true OR is_gemm_kloop = true OR has_k_loop = true)"
           allowed_methods: [GEMM_Rewrite_CUBLASLT_TF32]
           expected_speedup: large
-        
 
+        # ── Additional fallbacks (used when no NCU profiling is available) ──
+
+        # Multi-kernel fusion fallback (without CUDA Graph)
+        - id: MULTI_KERNEL_FUSION_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: S4
+          gate_when: "has_multiple_kernels_in_forward = true AND cudagraph_eligible = false"
+          allowed_methods: [KernelFusion, MultiKernelScheduling]
+          expected_speedup: small
+
+        # Pointwise + transcendentals (e.g., mish / gelu / swish)
+        - id: POINTWISE_TRANSCENDENTAL_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: [S0, S1]
+          gate_when: "is_pointwise = true AND uses_transcendentals = true"
+          allowed_methods: [Approximate_Transcendentals_or_LUT, Reduce_Instruction_Count, Vectorized_Math]
+          expected_speedup: medium
+
+        # Pointwise streaming without transcendentals (e.g., relu, abs, clip)
+        - id: POINTWISE_STREAMING_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: [S0, S1]
+          gate_when: "is_pointwise = true AND streaming_no_reuse = true AND uses_transcendentals = false"
+          allowed_methods: [Improve_Coalescing_and_TransactionSize, Increase_ILP_WorkPerThread, Vectorization_Refinement]
+          expected_speedup: medium
+
+        # Stencil / convolution-like kernels
+        - id: STENCIL_CONV_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: [S0, S1, S2, S3]
+          gate_when: "is_stencil_conv = true"
+          allowed_methods: [SharedMemoryTiling, Improve_Coalescing_and_TransactionSize]
+          expected_speedup: large
+
+        # GEMM-like without TensorCore eligibility
+        - id: GEMM_TILING_NO_TC_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: [S0, S1]
+          gate_when: "reuse_possible = true AND tc_eligible = false AND (is_naive_gemm = true OR is_gemm_kloop = true)"
+          allowed_methods: [SharedMemoryTiling, RegisterBlocking]
+          expected_speedup: large
+
+        # Reuse-capable kernels (general: shared tiles, register blocking, prefetch)
+        - id: REUSE_CAPABLE_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: [S0, S1]
+          gate_when: "reuse_possible = true AND tc_eligible = false"
+          allowed_methods: [SharedMemoryTiling, RegisterBlocking, SoftwarePrefetching]
+          expected_speedup: medium
+
+        # Reduction / scan pattern (S3)
+        - id: REDUCTION_SCAN_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: S3
+          allowed_methods: [Increase_ILP_WorkPerThread, Improve_Coalescing_and_TransactionSize, Increase_Memory_Level_Parallelism]
+          expected_speedup: medium
+
+        # Irregular / scatter-gather pattern (S2)
+        - id: IRREGULAR_S2_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: S2
+          allowed_methods: [Reduce_Instruction_Count, WarpUniformControlFlow, KernelFission, Improve_Coalescing_and_TransactionSize]
+          expected_speedup: medium
+
+        # Generic catch-all (S0/S1 that didn't match any specific pattern above)
+        - id: GENERIC_FALLBACK
+          headroom: [Tier-H, Tier-M, Tier-L]
+          kernel_structure: [S0, S1, S2, S3, S4]
+          allowed_methods: [Increase_ILP_WorkPerThread, Launch_Tuning, Improve_Coalescing_and_TransactionSize]
+          expected_speedup: small
 
 
 

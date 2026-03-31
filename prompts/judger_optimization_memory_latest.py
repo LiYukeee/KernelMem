@@ -497,6 +497,8 @@ def build_judger_optimization_prompts(
     nsys_csv_path: Optional[Path] = None,  # Optional path to nsys CSV file with kernel_launch_count
     io_dir: Optional[Path] = None,  # Optional directory to save machine_check_result JSON
     round_idx: Optional[int] = None,  # Optional round index for filename
+    profiling_mode: str = "ncu",  # "ncu" | "timing_only" | "static"
+    kernel_duration_ns: Optional[float] = None,  # Used when profiling_mode != "ncu"
 ) -> Tuple[str, str]:
     """Return (system_prompt_str, instruction_str) for single-issue optimisation.
 
@@ -518,6 +520,8 @@ def build_judger_optimization_prompts(
                   Passed to run_machine_check for judge_gate-based code_features extraction
         nsys_csv_path: Optional path to nsys CSV file containing kernel_launch_count
                        If provided, kernel_launch_count will be read from this file instead of using len(rows)
+        profiling_mode: "ncu" (default), "timing_only", or "static"
+        kernel_duration_ns: Kernel duration in nanoseconds (for timing_only mode)
     """
     gpu_info = _load_gpu_spec()
     if gpu_name not in gpu_info:
@@ -545,7 +549,116 @@ def build_judger_optimization_prompts(
     case_requirements_text = ""
     global_forbidden_rules_text = ""
 
-    if metrics_df is not None and not metrics_df.empty:
+    if profiling_mode in ("timing_only", "static"):
+        # --- No NCU profiling: call machine_check directly with profiling_mode ---
+        try:
+            machine_check_result = run_machine_check(
+                yaml_path=YAML_RULES_PATH,
+                metric_csv_path=None,
+                cuda_code=cuda_code,
+                arch_path=arch_path,
+                feature_mode="llm" if (call_llm is not None and cuda_code) else ("manual" if code_features else "heuristic"),
+                code_features=code_features,
+                call_llm=call_llm,
+                io_dir=io_dir,
+                round_idx=round_idx,
+                profiling_mode=profiling_mode,
+                kernel_duration_ns=kernel_duration_ns,
+            )
+
+            # Save machine_check_result to JSON file if io_dir and round_idx are provided
+            if io_dir is not None and round_idx is not None:
+                try:
+                    io_dir.mkdir(parents=True, exist_ok=True)
+                    machine_check_result_file = io_dir / f"round{round_idx:03d}_machine_check_result.json"
+                    import json
+                    with open(machine_check_result_file, 'w', encoding='utf-8') as f:
+                        json.dump(machine_check_result, f, indent=2, ensure_ascii=False)
+                    print(f"[machine_check] Saved machine_check_result to: {machine_check_result_file}")
+                except Exception as e:
+                    print(f"[machine_check] Warning: Failed to save machine_check_result JSON: {e}")
+
+            # Extract machine_check fields
+            machine_check_tier = machine_check_result.get("tier", "Tier-M")
+            machine_check_bottleneck = machine_check_result.get("bottleneck_id", "unknown")
+            machine_check_case = machine_check_result.get("case_id", "NO_MATCH")
+            machine_check_kernel_structure = machine_check_result.get("kernel_structure", "S0")
+            allowed_methods = machine_check_result.get("allowed_methods", [])
+            forbidden_methods = machine_check_result.get("forbidden_methods", [])
+            case_requirements = machine_check_result.get("requirements", {})
+            key_metrics = machine_check_result.get("key_metrics", {})
+
+            if allowed_methods:
+                allowed_methods_list = "\n".join(f"- {method_id}" for method_id in allowed_methods)
+            else:
+                allowed_methods_list = "- (No methods allowed - machine_check did not match any optimization methods. You should create your own optimization strategy based on the kernel code.)"
+
+            if forbidden_methods:
+                forbidden_methods_list = "\n".join(f"- {method_id}" for method_id in forbidden_methods)
+
+            if case_requirements:
+                req_lines = []
+                for method_id, req_list in case_requirements.items():
+                    if isinstance(req_list, list):
+                        req_lines.append(f"- **{method_id}**: {', '.join(req_list)}")
+                    else:
+                        req_lines.append(f"- **{method_id}**: {req_list}")
+                case_requirements_text = "\n".join(req_lines)
+
+            # Load global_forbidden_rules from YAML
+            try:
+                with open(YAML_RULES_PATH, 'r', encoding='utf-8') as f:
+                    yaml_rules = yaml.safe_load(f)
+                global_forbidden_rules = yaml_rules.get("machine_check", {}).get("global_forbidden_rules", [])
+                if global_forbidden_rules:
+                    rule_lines = []
+                    for rule in global_forbidden_rules:
+                        rule_id = rule.get("id", "Unknown")
+                        rule_desc = rule.get("description", "")
+                        rule_lines.append(f"- **{rule_id}**: {rule_desc}")
+                    global_forbidden_rules_text = "\n".join(rule_lines)
+            except Exception as e:
+                print(f"[judger] Warning: Failed to load global_forbidden_rules: {e}")
+
+            if key_metrics:
+                key_metrics_lines = []
+                for k, v in key_metrics.items():
+                    if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                        key_metrics_lines.append(f"  - {k}: {v}")
+                machine_check_key_metrics = "\n".join(key_metrics_lines) if key_metrics_lines else "N/A"
+
+            # Load method_catalog for allowed methods
+            if allowed_methods:
+                try:
+                    with open(YAML_RULES_PATH, 'r', encoding='utf-8') as f:
+                        yaml_rules = yaml.safe_load(f)
+                    method_catalog = yaml_rules.get("llm_assist", {}).get("method_catalog", {})
+                    method_catalog_lines = []
+                    for method_id in allowed_methods:
+                        if method_id in method_catalog:
+                            method_info = method_catalog[method_id]
+                            method_catalog_lines.append(f"**{method_id}**:")
+                            if "intent" in method_info:
+                                method_catalog_lines.append(f"  Intent: {method_info['intent']}")
+                            if "mechanism_requirements" in method_info:
+                                method_catalog_lines.append(f"  Requirements: {', '.join(method_info['mechanism_requirements'])}")
+                            if "expected_metric_change" in method_info:
+                                method_catalog_lines.append(f"  Expected changes: {', '.join(method_info['expected_metric_change'])}")
+                            if "forbidden_patterns" in method_info:
+                                method_catalog_lines.append(f"  Forbidden: {', '.join(method_info['forbidden_patterns'])}")
+                            method_catalog_lines.append("")
+                    if method_catalog_lines:
+                        method_catalog_text = "\n".join(method_catalog_lines)
+                except Exception as e:
+                    print(f"[judger] Warning: Failed to load method catalog: {e}")
+
+        except Exception as e:
+            import warnings
+            warnings.warn(f"machine_check failed ({profiling_mode} mode): {e}. Using defaults.")
+            allowed_methods = []
+            allowed_methods_list = "- (machine_check failed - all methods allowed as fallback)"
+
+    elif metrics_df is not None and not metrics_df.empty:
         try:
             # Create a temporary CSV file from metrics_df for machine_check ver2
             # machine_check ver2.run_machine_check requires a CSV file path

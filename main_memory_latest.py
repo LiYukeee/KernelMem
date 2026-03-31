@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from run_ncu_memory import profile_bench, load_ncu_metrics, metrics_to_prompt
 from run_nsys import profile_bench as nsys_profile_bench, load_nsys_stats
+from run_timing_profiler import profile_timing, timing_metrics_to_prompt, build_empty_metrics_df
 import matplotlib
 matplotlib.use("Agg")  # headless save
 import matplotlib.pyplot as plt
@@ -74,6 +75,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to summary.json file. If provided, only tasks with best_runnable=false will be selected from this summary.")
     
     p.add_argument("--subproc_id", type=int, default=0, help="Identifier for sub-process (e.g., when running multiple in parallel)")
+    p.add_argument("--profiling_mode", default="ncu",
+                   choices=["ncu", "timing_only", "static"],
+                   help="Profiling backend: ncu (full Nsight Compute), "
+                        "timing_only (CUDA event timing, no ncu/nsys), "
+                        "static (pure code analysis, no profiling at all)")
     
     return p
 
@@ -1090,183 +1096,410 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     # Only update best_kernel if the repaired kernel's score exceeds best_score
                     return repaired_kernel
                 
-                # ========== 预加载 kernel，确保编译缓存存在，避免 ncu 环境下重新编译 ==========
-                precompile_timeout = False
-                precompile_error_detail = ""
-                
-                print("[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...")
-                from multiprocessing import get_context
-                
-                try:
-                    ctx = get_context("spawn")
-                    parent_conn, child_conn = ctx.Pipe(duplex=False)
-                    p = ctx.Process(target=_preload_worker, args=(str(test_kernel), child_conn))
-                    p.start()
-                    child_conn.close()
-                    
-                    # 10 分钟超时
-                    p.join(timeout=600)
-                    
-                    if p.is_alive():
-                        print(f"[Pre-compile] Timeout after 10 minutes, terminating preload process...")
-                        p.terminate()
-                        p.join(timeout=5)
-                        if p.is_alive():
-                            p.kill()
-                            p.join()
-                        
-                        precompile_timeout = True
-                        precompile_error_detail = f"Preload process exceeded 10 minute timeout for kernel: {test_kernel}"
-                    else:
-                        # 检查结果
-                        if parent_conn.poll():
-                            status, msg = parent_conn.recv()
-                            if status == "ok":
-                                print("[Pre-compile] Kernel loaded successfully, .so is now cached")
-                            else:
-                                print(f"[Pre-compile] Warning: Failed to preload kernel: {msg}")
-                                precompile_timeout = True
-                                precompile_error_detail = f"Preload failed with error: {msg}"
-                        else:
-                            print("[Pre-compile] Warning: Preload process exited without sending result")
-                    
-                    parent_conn.close()
-                except Exception as e:
-                    print(f"[Pre-compile] Warning: Failed to preload kernel: {e}")
-                    precompile_timeout = True
-                    precompile_error_detail = f"Preload exception: {e}"
-                
-                # Handle pre-compile timeout by calling repair
-                if precompile_timeout:
-                    # Repair parent_kernel (best_kernel_temp) that failed to pre-compile
-                    ind = _handle_compilation_timeout("Pre-compile", precompile_error_detail, kernel_to_repair=parent_kernel)
-                    # The repaired kernel has been tested by _bench_and_score
-                    # It will be assigned to current_kernel at the end of the round
-                    # IMPORTANT: If parent_kernel == base_kernel and the repaired kernel passed testing,
-                    # we should update base_kernel even if score doesn't exceed base_score,
-                    # because the original base_kernel cannot pass pre-compile and is "invalid"
-                    if parent_kernel == base_kernel:
-                        runnable_repaired = bool(getattr(ind, "metrics", {}).get("runnable", False))
-                        score_repaired = ind.score if (ind.score is not None and runnable_repaired) else None
-                        if score_repaired is not None:
-                            # The repaired kernel passed testing, so it should replace the unprofilable base_kernel
-                            print(f"[Pre-compile] Repaired kernel (score={score_repaired:.4f}) passed testing, updating base_kernel even though score < base_score ({base_score:.4f})", flush=True)
-                            base_score = score_repaired
-                            base_kernel = ind
-                            # Also update best_kernel unconditionally if score is higher
-                            if score_repaired > best_score:
-                                best_score = score_repaired
-                                best_kernel = ind
-                            with open(test_kernel, "w") as f:
-                                f.write(base_kernel.code)
-                    # Otherwise, only update base_kernel if the repaired kernel's score exceeds base_score
-                    # (handled at the end of the round)
-                    # Continue to score tracking and next iteration
-                    
-                else:
-                    # ========== ncu profiling with timeout handling ==========
-                    ncu_timeout = False  # Flag to indicate if ncu profiling timed out
-                    ncu_error_detail = ""
-                    
-                    try:
-                        # For level3 tasks: use repeat=5 and timeout=30 minutes (1800 seconds)
-                        ncu_repeat = 3 if is_level3 else args.repeat
-                        ncu_timeout_seconds = 1800 if is_level3 else None  # 30 minutes for level3, None for default
-                        
-                        if is_level3:
-                            print(f"[ncu] Level3 task detected: using repeat={ncu_repeat}, timeout={ncu_timeout_seconds//60} minutes", flush=True)
-                        
-                        # 明确指定要 profile 的 kernel 文件（parent_kernel 的代码）
-                        kernel_file_to_profile = test_kernel  # test_kernel 已经包含了 parent_kernel.code
-                        print(f"[ncu] Profiling kernel from file: {kernel_file_to_profile} (parent_kernel: {parent_kernel.code_path if parent_kernel and hasattr(parent_kernel, 'code_path') else 'N/A'})", flush=True)
-                        
-                        csv_path_str = f"ncu_temp_{args.subproc_id}.csv"
-                        csv_path_result = profile_bench(
-                            bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
-                            kernel_names=kernel_names,  # 传递 kernel 名称，只监控指定的 kernel
-                            kernel_file=kernel_file_to_profile,  # 明确指定要 profile 的 kernel 文件
-                            out_csv=csv_path_str,
-                            device_idx=args.device,
-                            repeat=ncu_repeat,
-                            timeout_override=ncu_timeout_seconds,
-                        )
-                        # profile_bench returns the CSV path (already resolved), ensure it's a Path object
-                        csv_path = Path(csv_path_result) if csv_path_result else Path(csv_path_str).resolve()
-                        # Store csv_path for error handling
-                        csv_path_for_errors = csv_path.resolve()
-                        
-                        # Save ncu profiling results to profile folder (always save, even if parsing fails)
-                        # Use parent_kernel's filename to name the ncu csv file
-                        ncu_profile_path = None
-                        if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                            import shutil
-                            kernel_name = parent_kernel.code_path.stem  # e.g., "kernel_20251229_141824"
-                            ncu_profile_path = profile_dir / f"{kernel_name}_ncu.csv"
-                            if csv_path.exists() and csv_path.stat().st_size > 0:
-                                try:
-                                    shutil.copy2(csv_path, ncu_profile_path)
-                                    print(f"[ncu] Saved profiling results to: {ncu_profile_path}")
-                                except Exception as save_err:
-                                    print(f"[ncu] Warning: Failed to save profiling CSV: {save_err}")
-                        
-                        metrics_df, sections_dict = load_ncu_metrics(csv_path, extra_keep=("Kernel Name", "Block Size", "Grid Size"),
-                                                                      name_list=kernel_names, select="last")
-                        metrics_block = metrics_to_prompt(metrics_df, sections_dict=sections_dict)
-                        
-                        # ========== Run nsys profiling to get kernel launch counts ==========
-                        nsys_rep_path = None
-                        nsys_csv_path = None
+                # ========== Profiling mode branching ==========
+                if args.profiling_mode != "ncu":
+                    # ------- timing_only / static path (no ncu / nsys) -------
+                    metrics_block = ""
+                    metrics_df = None
+                    nsys_csv_path = None
+                    _kernel_duration_ns = None
+
+                    if args.profiling_mode == "timing_only":
+                        print("[timing_only] Running lightweight timing profiler (no ncu/nsys)...")
                         try:
-                            print(f"[nsys] Starting nsys profiling after ncu...", flush=True)
-                            nsys_rep_path = nsys_profile_bench(
+                            timing_result = profile_timing(
                                 bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
-                                kernel_names=kernel_names,
-                                kernel_file=kernel_file_to_profile,
-                                out_rep=f"nsys_temp_{args.subproc_id}.nsys-rep",
+                                kernel_file=test_kernel,
                                 device_idx=args.device,
-                                timeout=300,  # 5 minutes timeout
+                                repeat=args.repeat,
+                                warmup=args.warmup,
                             )
-                            # Extract and save launch counts
-                            nsys_csv_path = Path(f"nsys_temp_{args.subproc_id}.csv")
-                            nsys_df = load_nsys_stats(
-                                rep_path=nsys_rep_path,
-                                kernel_names=kernel_names,
-                                out_csv=nsys_csv_path,
+                            metrics_block = timing_metrics_to_prompt(timing_result)
+                            _kernel_duration_ns = timing_result["kernel_duration_ns"]
+                            metrics_df = build_empty_metrics_df(
+                                kernel_duration_ns=timing_result["kernel_duration_ns"],
+                                kernel_name=kernel_names[0] if kernel_names else "unknown",
                             )
-                            print(f"[nsys] Successfully extracted kernel launch counts", flush=True)
-                            
-                            # Save nsys results to profile folder
+                            # Save timing results to profile folder
                             if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
                                 import shutil
-                                kernel_name = parent_kernel.code_path.stem
-                                nsys_profile_rep_path = profile_dir / f"{kernel_name}_nsys.nsys-rep"
-                                nsys_profile_csv_path = profile_dir / f"{kernel_name}_nsys.csv"
-                                if nsys_rep_path.exists():
-                                    shutil.copy2(nsys_rep_path, nsys_profile_rep_path)
-                                    print(f"[nsys] Saved .nsys-rep to: {nsys_profile_rep_path}")
-                                if nsys_csv_path.exists():
-                                    shutil.copy2(nsys_csv_path, nsys_profile_csv_path)
-                                    print(f"[nsys] Saved .csv to: {nsys_profile_csv_path}")
-                        except Exception as nsys_error:
-                            print(f"[nsys] Warning: nsys profiling failed: {nsys_error}", flush=True)
-                            # Continue without nsys data - kernel_launch_count will fall back to len(rows)
-                            nsys_csv_path = None
+                                kname = parent_kernel.code_path.stem
+                                timing_profile_path = profile_dir / f"{kname}_timing.json"
+                                timing_profile_path.write_text(
+                                    json.dumps(timing_result, indent=2, ensure_ascii=False),
+                                    encoding="utf-8",
+                                )
+                                print(f"[timing_only] Saved timing to: {timing_profile_path}")
+                        except Exception as timing_err:
+                            print(f"[timing_only] WARNING: Timing profiler failed: {timing_err}")
+                    else:
+                        # static mode: no profiling at all
+                        print("[static] Skipping all profiling — pure code analysis mode")
+                        metrics_block = (
+                            "# Kernel Profiling Metrics\n\n"
+                            "**NOTE**: No profiling data is available (static analysis mode).\n"
+                            "Please infer the kernel's bottleneck entirely from code structure\n"
+                            "and algorithmic characteristics.\n"
+                        )
+
+                    # --- Shared judge + optimise flow (same as NCU normal path) ---
+                    parent_kernel_path = getattr(parent_kernel, "code_path", None) if parent_kernel else None
+
+                    opt_history_dir = None
+                    opt_history_file = None
+                    optimization_history = []
+                    if parent_kernel_path:
+                        parent_kernel_name = parent_kernel_path.stem
+                        opt_history_dir = code_dir / parent_kernel_name
+                        opt_history_dir.mkdir(parents=True, exist_ok=True)
+                        opt_history_file = opt_history_dir / f"opt_round_{round_idx:03d}.json"
+
+                        if opt_history_dir.exists():
+                            hist_files = sorted(opt_history_dir.glob("opt_round_*.json"),
+                                                key=lambda p: int(p.stem.split("_")[-1]) if p.stem.split("_")[-1].isdigit() else 0)
+                            for hist_file in hist_files:
+                                if hist_file == opt_history_file:
+                                    continue
+                                try:
+                                    hist_data = json.loads(hist_file.read_text(encoding="utf-8"))
+                                    if "test_timestamp" in hist_data or "speedup" in hist_data or "test_passed" in hist_data:
+                                        optimization_history.append(hist_data)
+                                except Exception as e:
+                                    print(f"[opt] Warning: Failed to read optimization history from {hist_file}: {e}")
+
+                        if optimization_history:
+                            optimization_history.sort(key=lambda x: x.get("round", 0))
+                            print(f"[opt] Loaded {len(optimization_history)} previous optimization attempts from {opt_history_dir}")
+
+                    parent_kernel_code = parent_kernel.code if parent_kernel and hasattr(parent_kernel, 'code') else (current_kernel.code if current_kernel else "")
+                    sys_judge__prompt, judge_prompt = build_judger_optimization_prompts(
+                        arch_path=task_path,
+                        gpu_name=args.gpu,
+                        ncu_metrics_block=metrics_block,
+                        metrics_df=metrics_df,
+                        cuda_code=parent_kernel_code,
+                        optimization_history=optimization_history if optimization_history else None,
+                        code_features=None,
+                        call_llm=call_llm,
+                        nsys_csv_path=nsys_csv_path,
+                        io_dir=io_dir,
+                        round_idx=round_idx,
+                        profiling_mode=args.profiling_mode,
+                        kernel_duration_ns=_kernel_duration_ns,
+                    )
+                    prompt_file = io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt"
+                    prompt_file.write_text(judge_prompt, encoding="utf-8")
+                    raw = call_llm(judge_prompt, sys_judge__prompt, log_path=log_path,
+                                   call_type="judge_optimization", round_idx=round_idx)
+                    io_dir.mkdir(parents=True, exist_ok=True)
+                    reply_file = io_dir / f"{round_idx}_optimization_strategy_reply.txt"
+                    reply_file.write_text(raw, encoding="utf-8")
+                    strategy_json = extract_json(raw)
+
+                    method_matched = False
+                    machine_check_result_file = io_dir / f"round{round_idx:03d}_machine_check_result.json"
+                    if machine_check_result_file.exists():
+                        try:
+                            with open(machine_check_result_file, 'r', encoding='utf-8') as f:
+                                machine_check_result = json.load(f)
+                            case_id = machine_check_result.get("case_id", "NO_MATCH")
+                            method_matched = (case_id != "NO_MATCH")
+                        except Exception as e:
+                            print(f"[WARNING] Failed to read machine_check_result.json: {e}.")
+                            method_matched = bool(
+                                strategy_json and isinstance(strategy_json, dict)
+                                and strategy_json.get("method_name")
+                                and str(strategy_json.get("method_name", "")).strip() != ""
+                            )
+                    else:
+                        method_matched = bool(
+                            strategy_json and isinstance(strategy_json, dict)
+                            and strategy_json.get("method_name")
+                            and str(strategy_json.get("method_name", "")).strip() != ""
+                        )
+
+                    if opt_history_file:
+                        opt_history = {
+                            "round": round_idx,
+                            "parent_kernel": str(parent_kernel_path) if parent_kernel_path else None,
+                            "parent_kernel_name": parent_kernel_name if parent_kernel_path else None,
+                            "optimization_strategy": strategy_json,
+                            "method_matched": method_matched,
+                            "timestamp": datetime.now().isoformat(),
+                            "runnable": None,
+                            "speedup": None,
+                            "test_passed": False,
+                            "repaired": False,
+                            "kernel_source": "",
+                        }
+                        opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
+                        opt_history_files[round_idx] = opt_history_file
+                        print(f"[opt] Optimization history saved to: {opt_history_file}")
+
+                    history_block = _build_history_block(code_dir, keep_last=max(round_idx, 5))
+                    opt_prompt = build_optimization_prompt(
+                        arch_path=parent_kernel_path if parent_kernel_path else current_kernel.code_path,
+                        gpu_name=args.gpu,
+                        history_block=history_block,
+                        optimization_suggestion=strategy_json
+                    )
+                    prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
+                    prompt_file.write_text(opt_prompt, encoding="utf-8")
+                    ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx,
+                                         log_path=log_path, call_type="optimization")
+                    _bench_and_score(
+                        ind,
+                        ref_py=task_path,
+                        device_idx=args.device,
+                        warmup=args.warmup,
+                        repeat=args.repeat,
+                        tol=args.tol,
+                        phase="opt",
+                        metrics_dir=eval_dir,
+                    )
+
+                    opt_kernel_runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
+                    opt_kernel_score = ind.score if (ind.score is not None and opt_kernel_runnable) else None
+                    if not opt_kernel_runnable or opt_kernel_score is None:
+                        print(f"[opt] Optimized kernel failed (runnable={opt_kernel_runnable}), will start repair chain if needed")
+
+                    if ind and hasattr(ind, 'code_path') and ind.code_path:
+                        kernel_name = ind.code_path.stem
+                        parent_name = parent_kernel.code_path.stem if (parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path) else None
+                        runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
+                        speedup = ind.score if (ind.score is not None and runnable) else None
+                        optimization_tree[kernel_name] = {
+                            "parent": parent_name,
+                            "kernel_name": kernel_name,
+                            "kernel_path": str(ind.code_path),
+                            "speedup": float(speedup) if speedup is not None else None,
+                            "runnable": runnable,
+                            "ncu_passed": False,
+                            "phase": "opt",
+                            "round": round_idx,
+                            "strategy": strategy_json if strategy_json else None,
+                            "method_matched": method_matched,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+
+                    if opt_history_file and opt_history_file.exists():
+                        try:
+                            opt_history = json.loads(opt_history_file.read_text(encoding="utf-8"))
+                            runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
+                            speedup = ind.score if (ind.score is not None and runnable) else None
+                            opt_history["runnable"] = runnable
+                            opt_history["speedup"] = float(speedup) if speedup is not None else None
+                            opt_history["test_passed"] = runnable and speedup is not None
+                            opt_history["test_kernel"] = str(getattr(ind, "code_path", None)) if hasattr(ind, "code_path") else None
+                            opt_history["test_timestamp"] = datetime.now().isoformat()
+                            opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
+                            if runnable and speedup is not None:
+                                print(f"[opt] Optimization history updated: speedup={speedup:.4f}")
+                        except Exception as e:
+                            print(f"[opt] Warning: Failed to update optimization history: {e}")
+
+                else:
+                    # ========== NCU profiling path (original logic) ==========
+                    # ========== 预加载 kernel，确保编译缓存存在，避免 ncu 环境下重新编译 ==========
+                    precompile_timeout = False
+                    precompile_error_detail = ""
+                
+                    print("[Pre-compile] Loading kernel to ensure .so is cached before ncu profiling...")
+                    from multiprocessing import get_context
+                
+                    try:
+                        ctx = get_context("spawn")
+                        parent_conn, child_conn = ctx.Pipe(duplex=False)
+                        p = ctx.Process(target=_preload_worker, args=(str(test_kernel), child_conn))
+                        p.start()
+                        child_conn.close()
+                    
+                        # 10 分钟超时
+                        p.join(timeout=600)
+                    
+                        if p.is_alive():
+                            print(f"[Pre-compile] Timeout after 10 minutes, terminating preload process...")
+                            p.terminate()
+                            p.join(timeout=5)
+                            if p.is_alive():
+                                p.kill()
+                                p.join()
                         
-                        # Update optimization tree: mark this kernel as having passed ncu
-                        if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                            kernel_name = parent_kernel.code_path.stem
-                            if kernel_name in optimization_tree:
-                                optimization_tree[kernel_name]["ncu_passed"] = True
-                                if ncu_profile_path and ncu_profile_path.exists():
-                                    optimization_tree[kernel_name]["ncu_profile_path"] = str(ncu_profile_path)
-                    except RuntimeError as ncu_error:
-                        # Check if it's a timeout error
-                        if "timed out" in str(ncu_error).lower():
-                            ncu_timeout = True
-                            ncu_error_detail = str(ncu_error)
+                            precompile_timeout = True
+                            precompile_error_detail = f"Preload process exceeded 10 minute timeout for kernel: {test_kernel}"
                         else:
-                            # Other ncu errors - still save the CSV if it exists (partial results)
-                            print(f"[ncu] ERROR: Profiling failed: {ncu_error}")
+                            # 检查结果
+                            if parent_conn.poll():
+                                status, msg = parent_conn.recv()
+                                if status == "ok":
+                                    print("[Pre-compile] Kernel loaded successfully, .so is now cached")
+                                else:
+                                    print(f"[Pre-compile] Warning: Failed to preload kernel: {msg}")
+                                    precompile_timeout = True
+                                    precompile_error_detail = f"Preload failed with error: {msg}"
+                            else:
+                                print("[Pre-compile] Warning: Preload process exited without sending result")
+                    
+                        parent_conn.close()
+                    except Exception as e:
+                        print(f"[Pre-compile] Warning: Failed to preload kernel: {e}")
+                        precompile_timeout = True
+                        precompile_error_detail = f"Preload exception: {e}"
+                
+                    # Handle pre-compile timeout by calling repair
+                    if precompile_timeout:
+                        # Repair parent_kernel (best_kernel_temp) that failed to pre-compile
+                        ind = _handle_compilation_timeout("Pre-compile", precompile_error_detail, kernel_to_repair=parent_kernel)
+                        # The repaired kernel has been tested by _bench_and_score
+                        # It will be assigned to current_kernel at the end of the round
+                        # IMPORTANT: If parent_kernel == base_kernel and the repaired kernel passed testing,
+                        # we should update base_kernel even if score doesn't exceed base_score,
+                        # because the original base_kernel cannot pass pre-compile and is "invalid"
+                        if parent_kernel == base_kernel:
+                            runnable_repaired = bool(getattr(ind, "metrics", {}).get("runnable", False))
+                            score_repaired = ind.score if (ind.score is not None and runnable_repaired) else None
+                            if score_repaired is not None:
+                                # The repaired kernel passed testing, so it should replace the unprofilable base_kernel
+                                print(f"[Pre-compile] Repaired kernel (score={score_repaired:.4f}) passed testing, updating base_kernel even though score < base_score ({base_score:.4f})", flush=True)
+                                base_score = score_repaired
+                                base_kernel = ind
+                                # Also update best_kernel unconditionally if score is higher
+                                if score_repaired > best_score:
+                                    best_score = score_repaired
+                                    best_kernel = ind
+                                with open(test_kernel, "w") as f:
+                                    f.write(base_kernel.code)
+                        # Otherwise, only update base_kernel if the repaired kernel's score exceeds base_score
+                        # (handled at the end of the round)
+                        # Continue to score tracking and next iteration
+                    
+                    else:
+                        # ========== ncu profiling with timeout handling ==========
+                        ncu_timeout = False  # Flag to indicate if ncu profiling timed out
+                        ncu_error_detail = ""
+                    
+                        try:
+                            # For level3 tasks: use repeat=5 and timeout=30 minutes (1800 seconds)
+                            ncu_repeat = 3 if is_level3 else args.repeat
+                            ncu_timeout_seconds = 1800 if is_level3 else None  # 30 minutes for level3, None for default
+                        
+                            if is_level3:
+                                print(f"[ncu] Level3 task detected: using repeat={ncu_repeat}, timeout={ncu_timeout_seconds//60} minutes", flush=True)
+                        
+                            # 明确指定要 profile 的 kernel 文件（parent_kernel 的代码）
+                            kernel_file_to_profile = test_kernel  # test_kernel 已经包含了 parent_kernel.code
+                            print(f"[ncu] Profiling kernel from file: {kernel_file_to_profile} (parent_kernel: {parent_kernel.code_path if parent_kernel and hasattr(parent_kernel, 'code_path') else 'N/A'})", flush=True)
+                        
+                            csv_path_str = f"ncu_temp_{args.subproc_id}.csv"
+                            csv_path_result = profile_bench(
+                                bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
+                                kernel_names=kernel_names,  # 传递 kernel 名称，只监控指定的 kernel
+                                kernel_file=kernel_file_to_profile,  # 明确指定要 profile 的 kernel 文件
+                                out_csv=csv_path_str,
+                                device_idx=args.device,
+                                repeat=ncu_repeat,
+                                timeout_override=ncu_timeout_seconds,
+                            )
+                            # profile_bench returns the CSV path (already resolved), ensure it's a Path object
+                            csv_path = Path(csv_path_result) if csv_path_result else Path(csv_path_str).resolve()
+                            # Store csv_path for error handling
+                            csv_path_for_errors = csv_path.resolve()
+                        
+                            # Save ncu profiling results to profile folder (always save, even if parsing fails)
+                            # Use parent_kernel's filename to name the ncu csv file
+                            ncu_profile_path = None
+                            if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
+                                import shutil
+                                kernel_name = parent_kernel.code_path.stem  # e.g., "kernel_20251229_141824"
+                                ncu_profile_path = profile_dir / f"{kernel_name}_ncu.csv"
+                                if csv_path.exists() and csv_path.stat().st_size > 0:
+                                    try:
+                                        shutil.copy2(csv_path, ncu_profile_path)
+                                        print(f"[ncu] Saved profiling results to: {ncu_profile_path}")
+                                    except Exception as save_err:
+                                        print(f"[ncu] Warning: Failed to save profiling CSV: {save_err}")
+                        
+                            metrics_df, sections_dict = load_ncu_metrics(csv_path, extra_keep=("Kernel Name", "Block Size", "Grid Size"),
+                                                                          name_list=kernel_names, select="last")
+                            metrics_block = metrics_to_prompt(metrics_df, sections_dict=sections_dict)
+                        
+                            # ========== Run nsys profiling to get kernel launch counts ==========
+                            nsys_rep_path = None
+                            nsys_csv_path = None
+                            try:
+                                print(f"[nsys] Starting nsys profiling after ncu...", flush=True)
+                                nsys_rep_path = nsys_profile_bench(
+                                    bench_py=f"bench_ref_inputs_{args.subproc_id}.py",
+                                    kernel_names=kernel_names,
+                                    kernel_file=kernel_file_to_profile,
+                                    out_rep=f"nsys_temp_{args.subproc_id}.nsys-rep",
+                                    device_idx=args.device,
+                                    timeout=300,  # 5 minutes timeout
+                                )
+                                # Extract and save launch counts
+                                nsys_csv_path = Path(f"nsys_temp_{args.subproc_id}.csv")
+                                nsys_df = load_nsys_stats(
+                                    rep_path=nsys_rep_path,
+                                    kernel_names=kernel_names,
+                                    out_csv=nsys_csv_path,
+                                )
+                                print(f"[nsys] Successfully extracted kernel launch counts", flush=True)
+                            
+                                # Save nsys results to profile folder
+                                if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
+                                    import shutil
+                                    kernel_name = parent_kernel.code_path.stem
+                                    nsys_profile_rep_path = profile_dir / f"{kernel_name}_nsys.nsys-rep"
+                                    nsys_profile_csv_path = profile_dir / f"{kernel_name}_nsys.csv"
+                                    if nsys_rep_path.exists():
+                                        shutil.copy2(nsys_rep_path, nsys_profile_rep_path)
+                                        print(f"[nsys] Saved .nsys-rep to: {nsys_profile_rep_path}")
+                                    if nsys_csv_path.exists():
+                                        shutil.copy2(nsys_csv_path, nsys_profile_csv_path)
+                                        print(f"[nsys] Saved .csv to: {nsys_profile_csv_path}")
+                            except Exception as nsys_error:
+                                print(f"[nsys] Warning: nsys profiling failed: {nsys_error}", flush=True)
+                                # Continue without nsys data - kernel_launch_count will fall back to len(rows)
+                                nsys_csv_path = None
+                        
+                            # Update optimization tree: mark this kernel as having passed ncu
+                            if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
+                                kernel_name = parent_kernel.code_path.stem
+                                if kernel_name in optimization_tree:
+                                    optimization_tree[kernel_name]["ncu_passed"] = True
+                                    if ncu_profile_path and ncu_profile_path.exists():
+                                        optimization_tree[kernel_name]["ncu_profile_path"] = str(ncu_profile_path)
+                        except RuntimeError as ncu_error:
+                            # Check if it's a timeout error
+                            if "timed out" in str(ncu_error).lower():
+                                ncu_timeout = True
+                                ncu_error_detail = str(ncu_error)
+                            else:
+                                # Other ncu errors - still save the CSV if it exists (partial results)
+                                print(f"[ncu] ERROR: Profiling failed: {ncu_error}")
+                                # Try to save partial CSV results if available
+                                if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
+                                    import shutil
+                                    kernel_name = parent_kernel.code_path.stem
+                                    # Use the csv_path from profile_bench if available, otherwise try to find it
+                                    csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else Path(f"ncu_temp_{args.subproc_id}.csv").resolve()
+                                    if csv_path_temp.exists() and csv_path_temp.stat().st_size > 0:
+                                        ncu_profile_path = profile_dir / f"{kernel_name}_ncu_error.csv"
+                                        try:
+                                            shutil.copy2(csv_path_temp, ncu_profile_path)
+                                            print(f"[ncu] Saved partial profiling results (error) to: {ncu_profile_path}")
+                                        except Exception as save_err:
+                                            print(f"[ncu] Warning: Failed to save error CSV: {save_err}")
+                                    # Mark parent_kernel as not passing ncu
+                                    if kernel_name in optimization_tree:
+                                        optimization_tree[kernel_name]["ncu_passed"] = False
+                                print(f"[{task_path.name}] Using previous kernel and continuing")
+                                ind = current_kernel
+                                scores.append(last_score_for_curve)
+                                err_flags.append(True)
+                                continue
+                        except Exception as ncu_error:
+                            print(f"[ncu] ERROR: Unexpected profiling error: {ncu_error}")
                             # Try to save partial CSV results if available
                             if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
                                 import shutil
@@ -1280,156 +1513,142 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                         print(f"[ncu] Saved partial profiling results (error) to: {ncu_profile_path}")
                                     except Exception as save_err:
                                         print(f"[ncu] Warning: Failed to save error CSV: {save_err}")
-                                # Mark parent_kernel as not passing ncu
-                                if kernel_name in optimization_tree:
-                                    optimization_tree[kernel_name]["ncu_passed"] = False
                             print(f"[{task_path.name}] Using previous kernel and continuing")
                             ind = current_kernel
                             scores.append(last_score_for_curve)
                             err_flags.append(True)
                             continue
-                    except Exception as ncu_error:
-                        print(f"[ncu] ERROR: Unexpected profiling error: {ncu_error}")
-                        # Try to save partial CSV results if available
-                        if parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
+                    
+                        # Handle ncu timeout by calling repair
+                        # Mark parent_kernel as not passing ncu and save timeout CSV if available
+                        if ncu_timeout and parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
                             import shutil
                             kernel_name = parent_kernel.code_path.stem
                             # Use the csv_path from profile_bench if available, otherwise try to find it
                             csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else Path(f"ncu_temp_{args.subproc_id}.csv").resolve()
                             if csv_path_temp.exists() and csv_path_temp.stat().st_size > 0:
-                                ncu_profile_path = profile_dir / f"{kernel_name}_ncu_error.csv"
+                                ncu_profile_path = profile_dir / f"{kernel_name}_ncu_timeout.csv"
                                 try:
                                     shutil.copy2(csv_path_temp, ncu_profile_path)
-                                    print(f"[ncu] Saved partial profiling results (error) to: {ncu_profile_path}")
+                                    print(f"[ncu] Saved profiling results (timeout) to: {ncu_profile_path}")
                                 except Exception as save_err:
-                                    print(f"[ncu] Warning: Failed to save error CSV: {save_err}")
-                        print(f"[{task_path.name}] Using previous kernel and continuing")
-                        ind = current_kernel
-                        scores.append(last_score_for_curve)
-                        err_flags.append(True)
-                        continue
+                                    print(f"[ncu] Warning: Failed to save timeout CSV: {save_err}")
+                            if kernel_name in optimization_tree:
+                                optimization_tree[kernel_name]["ncu_passed"] = False
                     
-                    # Handle ncu timeout by calling repair
-                    # Mark parent_kernel as not passing ncu and save timeout CSV if available
-                    if ncu_timeout and parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path:
-                        import shutil
-                        kernel_name = parent_kernel.code_path.stem
-                        # Use the csv_path from profile_bench if available, otherwise try to find it
-                        csv_path_temp = csv_path_for_errors if 'csv_path_for_errors' in locals() else Path(f"ncu_temp_{args.subproc_id}.csv").resolve()
-                        if csv_path_temp.exists() and csv_path_temp.stat().st_size > 0:
-                            ncu_profile_path = profile_dir / f"{kernel_name}_ncu_timeout.csv"
-                            try:
-                                shutil.copy2(csv_path_temp, ncu_profile_path)
-                                print(f"[ncu] Saved profiling results (timeout) to: {ncu_profile_path}")
-                            except Exception as save_err:
-                                print(f"[ncu] Warning: Failed to save timeout CSV: {save_err}")
-                        if kernel_name in optimization_tree:
-                            optimization_tree[kernel_name]["ncu_passed"] = False
-                    
-                    if ncu_timeout:
-                        # Repair parent_kernel (best_kernel_temp) that failed ncu profiling
-                        # parent_kernel has not passed profiling yet, so it's still best_kernel_temp
-                        ind = _handle_compilation_timeout("ncu", ncu_error_detail, kernel_to_repair=parent_kernel)
-                        # The repaired kernel has been tested by _bench_and_score
-                        # It will be assigned to current_kernel at the end of the round
-                        # IMPORTANT: If parent_kernel == base_kernel and the repaired kernel passed testing,
-                        # we should update base_kernel even if score doesn't exceed base_score,
-                        # because the original base_kernel cannot pass ncu profiling and is "invalid"
-                        if parent_kernel == base_kernel:
-                            runnable_repaired = bool(getattr(ind, "metrics", {}).get("runnable", False))
-                            score_repaired = ind.score if (ind.score is not None and runnable_repaired) else None
-                            if score_repaired is not None:
-                                # The repaired kernel passed testing, so it should replace the unprofilable base_kernel
-                                print(f"[ncu] Repaired kernel (score={score_repaired:.4f}) passed testing, updating base_kernel even though score < base_score ({base_score:.4f})", flush=True)
-                                base_score = score_repaired
-                                base_kernel = ind
-                                # Also update best_kernel unconditionally if score is higher
-                                if score_repaired > best_score:
-                                    best_score = score_repaired
-                                    best_kernel = ind
-                                with open(test_kernel, "w") as f:
-                                    f.write(base_kernel.code)
-                        # Otherwise, only update base_kernel if the repaired kernel's score exceeds base_score
-                        # (handled at the end of the round)
+                        if ncu_timeout:
+                            # Repair parent_kernel (best_kernel_temp) that failed ncu profiling
+                            # parent_kernel has not passed profiling yet, so it's still best_kernel_temp
+                            ind = _handle_compilation_timeout("ncu", ncu_error_detail, kernel_to_repair=parent_kernel)
+                            # The repaired kernel has been tested by _bench_and_score
+                            # It will be assigned to current_kernel at the end of the round
+                            # IMPORTANT: If parent_kernel == base_kernel and the repaired kernel passed testing,
+                            # we should update base_kernel even if score doesn't exceed base_score,
+                            # because the original base_kernel cannot pass ncu profiling and is "invalid"
+                            if parent_kernel == base_kernel:
+                                runnable_repaired = bool(getattr(ind, "metrics", {}).get("runnable", False))
+                                score_repaired = ind.score if (ind.score is not None and runnable_repaired) else None
+                                if score_repaired is not None:
+                                    # The repaired kernel passed testing, so it should replace the unprofilable base_kernel
+                                    print(f"[ncu] Repaired kernel (score={score_repaired:.4f}) passed testing, updating base_kernel even though score < base_score ({base_score:.4f})", flush=True)
+                                    base_score = score_repaired
+                                    base_kernel = ind
+                                    # Also update best_kernel unconditionally if score is higher
+                                    if score_repaired > best_score:
+                                        best_score = score_repaired
+                                        best_kernel = ind
+                                    with open(test_kernel, "w") as f:
+                                        f.write(base_kernel.code)
+                            # Otherwise, only update base_kernel if the repaired kernel's score exceeds base_score
+                            # (handled at the end of the round)
                         
-                    else:
-                        # ========== Normal optimization flow (no timeout) ==========
-                        # parent_kernel (base_kernel_temp) has passed ncu profiling
-                        # Now we can consider it as a valid base_kernel candidate
-                        # Only update base_kernel if the optimization result exceeds base_score (with strict conditions)
-                        # parent_kernel was already determined at the start of optimization phase (line ~759)
-                        # Get the path for optimization history tracking
-                        parent_kernel_path = getattr(parent_kernel, "code_path", None) if parent_kernel else None
+                        else:
+                            # ========== Normal optimization flow (no timeout) ==========
+                            # parent_kernel (base_kernel_temp) has passed ncu profiling
+                            # Now we can consider it as a valid base_kernel candidate
+                            # Only update base_kernel if the optimization result exceeds base_score (with strict conditions)
+                            # parent_kernel was already determined at the start of optimization phase (line ~759)
+                            # Get the path for optimization history tracking
+                            parent_kernel_path = getattr(parent_kernel, "code_path", None) if parent_kernel else None
                         
-                        # Create optimization history directory based on parent kernel name
-                        opt_history_dir = None
-                        opt_history_file = None
-                        optimization_history = []
-                        if parent_kernel_path:
-                            parent_kernel_name = parent_kernel_path.stem  # e.g., "kernel_20251225_185242"
-                            opt_history_dir = code_dir / parent_kernel_name
-                            opt_history_dir.mkdir(parents=True, exist_ok=True)
-                            opt_history_file = opt_history_dir / f"opt_round_{round_idx:03d}.json"
+                            # Create optimization history directory based on parent kernel name
+                            opt_history_dir = None
+                            opt_history_file = None
+                            optimization_history = []
+                            if parent_kernel_path:
+                                parent_kernel_name = parent_kernel_path.stem  # e.g., "kernel_20251225_185242"
+                                opt_history_dir = code_dir / parent_kernel_name
+                                opt_history_dir.mkdir(parents=True, exist_ok=True)
+                                opt_history_file = opt_history_dir / f"opt_round_{round_idx:03d}.json"
                             
-                            # Read all previous optimization history files from this directory
-                            if opt_history_dir.exists():
-                                hist_files = sorted(opt_history_dir.glob("opt_round_*.json"), 
-                                                   key=lambda p: int(p.stem.split("_")[-1]) if p.stem.split("_")[-1].isdigit() else 0)
-                                for hist_file in hist_files:
-                                    # Skip the current round's file (not yet completed)
-                                    if hist_file == opt_history_file:
-                                        continue
-                                    try:
-                                        hist_data = json.loads(hist_file.read_text(encoding="utf-8"))
-                                        # Only include completed attempts (with test results)
-                                        if "test_timestamp" in hist_data or "speedup" in hist_data or "test_passed" in hist_data:
-                                            optimization_history.append(hist_data)
-                                    except Exception as e:
-                                        print(f"[opt] Warning: Failed to read optimization history from {hist_file}: {e}")
+                                # Read all previous optimization history files from this directory
+                                if opt_history_dir.exists():
+                                    hist_files = sorted(opt_history_dir.glob("opt_round_*.json"), 
+                                                       key=lambda p: int(p.stem.split("_")[-1]) if p.stem.split("_")[-1].isdigit() else 0)
+                                    for hist_file in hist_files:
+                                        # Skip the current round's file (not yet completed)
+                                        if hist_file == opt_history_file:
+                                            continue
+                                        try:
+                                            hist_data = json.loads(hist_file.read_text(encoding="utf-8"))
+                                            # Only include completed attempts (with test results)
+                                            if "test_timestamp" in hist_data or "speedup" in hist_data or "test_passed" in hist_data:
+                                                optimization_history.append(hist_data)
+                                        except Exception as e:
+                                            print(f"[opt] Warning: Failed to read optimization history from {hist_file}: {e}")
                             
-                            if optimization_history:
-                                # Sort by round number to maintain chronological order
-                                optimization_history.sort(key=lambda x: x.get("round", 0))
-                                print(f"[opt] Loaded {len(optimization_history)} previous optimization attempts from {opt_history_dir}")
+                                if optimization_history:
+                                    # Sort by round number to maintain chronological order
+                                    optimization_history.sort(key=lambda x: x.get("round", 0))
+                                    print(f"[opt] Loaded {len(optimization_history)} previous optimization attempts from {opt_history_dir}")
                         
-                        # Use parent_kernel.code (base_kernel) for judge LLM, not current_kernel
-                        # This is the kernel we want to analyze and optimize
-                        parent_kernel_code = parent_kernel.code if parent_kernel and hasattr(parent_kernel, 'code') else (current_kernel.code if current_kernel else "")  # type: ignore[union-attr]
-                        sys_judge__prompt, judge_prompt = build_judger_optimization_prompts(
-                            arch_path=task_path,
-                            gpu_name=args.gpu,
-                            ncu_metrics_block=metrics_block,
-                            metrics_df=metrics_df,  # Pass metrics_df for machine_check
-                            cuda_code=parent_kernel_code,  # Use parent_kernel (best_kernel) code
-                            optimization_history=optimization_history if optimization_history else None,
-                            code_features=None,  # Will be extracted via judge_gate if call_llm is provided
-                            call_llm=call_llm,  # Pass call_llm for code_features extraction
-                            nsys_csv_path=nsys_csv_path,  # Pass nsys CSV path for kernel_launch_count
-                            io_dir=io_dir,  # Pass io_dir for saving machine_check_result JSON
-                            round_idx=round_idx,  # Pass round_idx for filename
-                        )
-                        prompt_file = io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt"
-                        prompt_file.write_text(judge_prompt, encoding="utf-8")
-                        raw = call_llm(judge_prompt, sys_judge__prompt, log_path=log_path,
-                                       call_type="judge_optimization", round_idx=round_idx)
-                        io_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
-                        reply_file = io_dir / f"{round_idx}_optimization_strategy_reply.txt"
-                        reply_file.write_text(raw, encoding="utf-8")
-                        strategy_json = extract_json(raw)
+                            # Use parent_kernel.code (base_kernel) for judge LLM, not current_kernel
+                            # This is the kernel we want to analyze and optimize
+                            parent_kernel_code = parent_kernel.code if parent_kernel and hasattr(parent_kernel, 'code') else (current_kernel.code if current_kernel else "")  # type: ignore[union-attr]
+                            sys_judge__prompt, judge_prompt = build_judger_optimization_prompts(
+                                arch_path=task_path,
+                                gpu_name=args.gpu,
+                                ncu_metrics_block=metrics_block,
+                                metrics_df=metrics_df,  # Pass metrics_df for machine_check
+                                cuda_code=parent_kernel_code,  # Use parent_kernel (best_kernel) code
+                                optimization_history=optimization_history if optimization_history else None,
+                                code_features=None,  # Will be extracted via judge_gate if call_llm is provided
+                                call_llm=call_llm,  # Pass call_llm for code_features extraction
+                                nsys_csv_path=nsys_csv_path,  # Pass nsys CSV path for kernel_launch_count
+                                io_dir=io_dir,  # Pass io_dir for saving machine_check_result JSON
+                                round_idx=round_idx,  # Pass round_idx for filename
+                            )
+                            prompt_file = io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt"
+                            prompt_file.write_text(judge_prompt, encoding="utf-8")
+                            raw = call_llm(judge_prompt, sys_judge__prompt, log_path=log_path,
+                                           call_type="judge_optimization", round_idx=round_idx)
+                            io_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
+                            reply_file = io_dir / f"{round_idx}_optimization_strategy_reply.txt"
+                            reply_file.write_text(raw, encoding="utf-8")
+                            strategy_json = extract_json(raw)
 
-                        # Check if method was matched based on machine_check_result
-                        # Read machine_check_result JSON file to determine if method was matched
-                        method_matched = False
-                        machine_check_result_file = io_dir / f"round{round_idx:03d}_machine_check_result.json"
-                        if machine_check_result_file.exists():
-                            try:
-                                with open(machine_check_result_file, 'r', encoding='utf-8') as f:
-                                    machine_check_result = json.load(f)
-                                case_id = machine_check_result.get("case_id", "NO_MATCH")
-                                # method_matched is True only if case_id is not "NO_MATCH"
-                                method_matched = (case_id != "NO_MATCH")
-                            except Exception as e:
-                                print(f"[WARNING] Failed to read machine_check_result.json: {e}. Falling back to checking method_name.")
+                            # Check if method was matched based on machine_check_result
+                            # Read machine_check_result JSON file to determine if method was matched
+                            method_matched = False
+                            machine_check_result_file = io_dir / f"round{round_idx:03d}_machine_check_result.json"
+                            if machine_check_result_file.exists():
+                                try:
+                                    with open(machine_check_result_file, 'r', encoding='utf-8') as f:
+                                        machine_check_result = json.load(f)
+                                    case_id = machine_check_result.get("case_id", "NO_MATCH")
+                                    # method_matched is True only if case_id is not "NO_MATCH"
+                                    method_matched = (case_id != "NO_MATCH")
+                                except Exception as e:
+                                    print(f"[WARNING] Failed to read machine_check_result.json: {e}. Falling back to checking method_name.")
+                                    # Fallback: check if method_name exists
+                                    method_matched = bool(
+                                        strategy_json 
+                                        and isinstance(strategy_json, dict)
+                                        and strategy_json.get("method_name")
+                                        and str(strategy_json.get("method_name", "")).strip() != ""
+                                    )
+                            else:
+                                print(f"[WARNING] machine_check_result.json not found: {machine_check_result_file}. Falling back to checking method_name.")
                                 # Fallback: check if method_name exists
                                 method_matched = bool(
                                     strategy_json 
@@ -1437,114 +1656,105 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                     and strategy_json.get("method_name")
                                     and str(strategy_json.get("method_name", "")).strip() != ""
                                 )
-                        else:
-                            print(f"[WARNING] machine_check_result.json not found: {machine_check_result_file}. Falling back to checking method_name.")
-                            # Fallback: check if method_name exists
-                            method_matched = bool(
-                                strategy_json 
-                                and isinstance(strategy_json, dict)
-                                and strategy_json.get("method_name")
-                                and str(strategy_json.get("method_name", "")).strip() != ""
-                            )
 
-                        # Save optimization strategy to history file
-                        if opt_history_file:
-                            opt_history = {
-                                "round": round_idx,
-                                "parent_kernel": str(parent_kernel_path) if parent_kernel_path else None,
-                                "parent_kernel_name": parent_kernel_name if parent_kernel_path else None,
-                                "optimization_strategy": strategy_json,
-                                "method_matched": method_matched,
-                                "timestamp": datetime.now().isoformat(),
-                                "runnable": None,  # Will be updated after testing
-                                "speedup": None,   # Will be updated after testing
-                                "test_passed": False,
-                                "repaired": False,  # Will be set to True if repaired
-                                "kernel_source": getattr(ind, "code", ""),  # Save generated kernel source for this round
-                            }
-                            opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
-                            # Track this opt history file for potential repair updates
-                            opt_history_files[round_idx] = opt_history_file
-                            print(f"[opt] Optimization history saved to: {opt_history_file}")
+                            # Save optimization strategy to history file
+                            if opt_history_file:
+                                opt_history = {
+                                    "round": round_idx,
+                                    "parent_kernel": str(parent_kernel_path) if parent_kernel_path else None,
+                                    "parent_kernel_name": parent_kernel_name if parent_kernel_path else None,
+                                    "optimization_strategy": strategy_json,
+                                    "method_matched": method_matched,
+                                    "timestamp": datetime.now().isoformat(),
+                                    "runnable": None,  # Will be updated after testing
+                                    "speedup": None,   # Will be updated after testing
+                                    "test_passed": False,
+                                    "repaired": False,  # Will be set to True if repaired
+                                    "kernel_source": getattr(ind, "code", ""),  # Save generated kernel source for this round
+                                }
+                                opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
+                                # Track this opt history file for potential repair updates
+                                opt_history_files[round_idx] = opt_history_file
+                                print(f"[opt] Optimization history saved to: {opt_history_file}")
 
-                        # Build history block with previously generated kernels (keep last round_idx kernels, or at least 5)
-                        # For round 0, keep_last=0 means no history; for round 1+, keep_last should be round_idx to include all previous rounds
-                        history_block = _build_history_block(code_dir, keep_last=max(round_idx, 5))
-                        # Use parent_kernel (best_kernel) for optimization, not current_kernel
-                        opt_prompt = build_optimization_prompt(
-                            arch_path=parent_kernel_path if parent_kernel_path else current_kernel.code_path,  # type: ignore[union-attr]
-                            gpu_name=args.gpu,
-                            history_block=history_block,  # Pass history_block to include previously generated kernels
-                            optimization_suggestion=strategy_json
-                        )
-                        prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
-                        prompt_file.write_text(opt_prompt, encoding="utf-8")
-                        ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx,
-                                             log_path=log_path, call_type="optimization")
-                        _bench_and_score(
-                            ind,
-                            ref_py=task_path,
-                            device_idx=args.device,
-                            warmup=args.warmup,
-                            repeat=args.repeat,
-                            tol=args.tol,
-                            phase="opt",
-                            metrics_dir=eval_dir,
-                        )
-                        
-                        # Check if optimized kernel failed - if so, prepare for potential repair chain
-                        # The repair chain will be started in the repair phase if the kernel is not runnable
-                        opt_kernel_runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
-                        opt_kernel_score = ind.score if (ind.score is not None and opt_kernel_runnable) else None
-                        if not opt_kernel_runnable or opt_kernel_score is None:
-                            # Optimized kernel failed, will need repair
-                            # If there's no active repair chain, the repair phase will start one with this kernel
-                            print(f"[opt] Optimized kernel failed (runnable={opt_kernel_runnable}), will start repair chain if needed")
-                        
-                        # Record optimized kernel in optimization tree
-                        if ind and hasattr(ind, 'code_path') and ind.code_path:
-                            kernel_name = ind.code_path.stem
-                            parent_name = parent_kernel.code_path.stem if (parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path) else None
-                            runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
-                            speedup = ind.score if (ind.score is not None and runnable) else None
-                            # Check if method was matched (method_name exists and is not empty)
-                            method_matched = bool(
-                                strategy_json 
-                                and isinstance(strategy_json, dict)
-                                and strategy_json.get("method_name")
-                                and str(strategy_json.get("method_name", "")).strip() != ""
+                            # Build history block with previously generated kernels (keep last round_idx kernels, or at least 5)
+                            # For round 0, keep_last=0 means no history; for round 1+, keep_last should be round_idx to include all previous rounds
+                            history_block = _build_history_block(code_dir, keep_last=max(round_idx, 5))
+                            # Use parent_kernel (best_kernel) for optimization, not current_kernel
+                            opt_prompt = build_optimization_prompt(
+                                arch_path=parent_kernel_path if parent_kernel_path else current_kernel.code_path,  # type: ignore[union-attr]
+                                gpu_name=args.gpu,
+                                history_block=history_block,  # Pass history_block to include previously generated kernels
+                                optimization_suggestion=strategy_json
                             )
-                            
-                            optimization_tree[kernel_name] = {
-                                "parent": parent_name,
-                                "kernel_name": kernel_name,
-                                "kernel_path": str(ind.code_path),
-                                "speedup": float(speedup) if speedup is not None else None,
-                                "runnable": runnable,
-                                "ncu_passed": True,  # This kernel's parent went through ncu profiling
-                                "phase": "opt",
-                                "round": round_idx,
-                                "strategy": strategy_json if strategy_json else None,
-                                "method_matched": method_matched,
-                                "timestamp": datetime.now().isoformat(),
-                            }
+                            prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
+                            prompt_file.write_text(opt_prompt, encoding="utf-8")
+                            ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx,
+                                                 log_path=log_path, call_type="optimization")
+                            _bench_and_score(
+                                ind,
+                                ref_py=task_path,
+                                device_idx=args.device,
+                                warmup=args.warmup,
+                                repeat=args.repeat,
+                                tol=args.tol,
+                                phase="opt",
+                                metrics_dir=eval_dir,
+                            )
                         
-                        # Update optimization history after testing
-                        if opt_history_file and opt_history_file.exists():
-                            try:
-                                opt_history = json.loads(opt_history_file.read_text(encoding="utf-8"))
+                            # Check if optimized kernel failed - if so, prepare for potential repair chain
+                            # The repair chain will be started in the repair phase if the kernel is not runnable
+                            opt_kernel_runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
+                            opt_kernel_score = ind.score if (ind.score is not None and opt_kernel_runnable) else None
+                            if not opt_kernel_runnable or opt_kernel_score is None:
+                                # Optimized kernel failed, will need repair
+                                # If there's no active repair chain, the repair phase will start one with this kernel
+                                print(f"[opt] Optimized kernel failed (runnable={opt_kernel_runnable}), will start repair chain if needed")
+                        
+                            # Record optimized kernel in optimization tree
+                            if ind and hasattr(ind, 'code_path') and ind.code_path:
+                                kernel_name = ind.code_path.stem
+                                parent_name = parent_kernel.code_path.stem if (parent_kernel and hasattr(parent_kernel, 'code_path') and parent_kernel.code_path) else None
                                 runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
                                 speedup = ind.score if (ind.score is not None and runnable) else None
-                                opt_history["runnable"] = runnable
-                                opt_history["speedup"] = float(speedup) if speedup is not None else None
-                                opt_history["test_passed"] = runnable and speedup is not None
-                                opt_history["test_kernel"] = str(getattr(ind, "code_path", None)) if hasattr(ind, "code_path") else None
-                                opt_history["test_timestamp"] = datetime.now().isoformat()
-                                opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
-                                if runnable and speedup is not None:
-                                    print(f"[opt] Optimization history updated: speedup={speedup:.4f}")
-                            except Exception as e:
-                                print(f"[opt] Warning: Failed to update optimization history: {e}")
+                                # Check if method was matched (method_name exists and is not empty)
+                                method_matched = bool(
+                                    strategy_json 
+                                    and isinstance(strategy_json, dict)
+                                    and strategy_json.get("method_name")
+                                    and str(strategy_json.get("method_name", "")).strip() != ""
+                                )
+                            
+                                optimization_tree[kernel_name] = {
+                                    "parent": parent_name,
+                                    "kernel_name": kernel_name,
+                                    "kernel_path": str(ind.code_path),
+                                    "speedup": float(speedup) if speedup is not None else None,
+                                    "runnable": runnable,
+                                    "ncu_passed": True,  # This kernel's parent went through ncu profiling
+                                    "phase": "opt",
+                                    "round": round_idx,
+                                    "strategy": strategy_json if strategy_json else None,
+                                    "method_matched": method_matched,
+                                    "timestamp": datetime.now().isoformat(),
+                                }
+                        
+                            # Update optimization history after testing
+                            if opt_history_file and opt_history_file.exists():
+                                try:
+                                    opt_history = json.loads(opt_history_file.read_text(encoding="utf-8"))
+                                    runnable = bool(getattr(ind, "metrics", {}).get("runnable", False))
+                                    speedup = ind.score if (ind.score is not None and runnable) else None
+                                    opt_history["runnable"] = runnable
+                                    opt_history["speedup"] = float(speedup) if speedup is not None else None
+                                    opt_history["test_passed"] = runnable and speedup is not None
+                                    opt_history["test_kernel"] = str(getattr(ind, "code_path", None)) if hasattr(ind, "code_path") else None
+                                    opt_history["test_timestamp"] = datetime.now().isoformat()
+                                    opt_history_file.write_text(json.dumps(opt_history, indent=2, ensure_ascii=False), encoding="utf-8")
+                                    if runnable and speedup is not None:
+                                        print(f"[opt] Optimization history updated: speedup={speedup:.4f}")
+                                except Exception as e:
+                                    print(f"[opt] Warning: Failed to update optimization history: {e}")
 
         # -------- update state + record curve --------
         # current_kernel: 当前刚生成/修复完的kernel，用于记录和后续repair

@@ -85,10 +85,61 @@ def save_kernel_code(code: str, out_dir: Path | str = "kernels") -> Path:
 
 
 
+def _repair_json_str(s: str) -> str:
+    """Apply a series of heuristic repairs to LLM-generated JSON strings.
+
+    Handles common mistakes such as:
+    - Backslash-escaped outer quotes used as values: ``"key": \\"value\\"``
+    - Trailing commas before ``}`` or ``]``
+    - List/object values that should be strings (joined with newline)
+    """
+    # 1. Unescape backslash-quoted values: "key": \"value\" → "key": "value"
+    #    This replaces \" that appear at JSON-value positions (after : or [ , )
+    #    with a plain " so the JSON becomes valid.
+    s = re.sub(r'(?<=[:{,\[\s])\\"((?:[^"\\]|\\.)*)\\"\s*(?=[,}\]])',
+               lambda m: '"' + m.group(1) + '"', s)
+
+    # 2. Remove trailing commas inside objects/arrays, which Python json rejects.
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+
+    return s
+
+
+def _try_parse(candidate: str):
+    """Try json.loads; on failure apply _repair_json_str and retry."""
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_repair_json_str(candidate))
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def _normalize_strategy(obj: Any) -> Any:
+    """Convert list/dict field values to plain strings where the prompt schema
+    expects strings (``modification plan``, ``evidence``,
+    ``expected_metric_change``).  Operates in-place and returns the obj."""
+    if not isinstance(obj, dict):
+        return obj
+    _list_fields = {"modification plan", "evidence", "expected_metric_change",
+                    "modification_plan", "primary_optimisation_method"}
+    for key, val in obj.items():
+        if key in _list_fields:
+            if isinstance(val, list):
+                obj[key] = "\n".join(str(v) for v in val)
+            elif isinstance(val, dict):
+                obj[key] = json.dumps(val, ensure_ascii=False)
+    return obj
+
+
 def extract_json(raw: str) -> Any:
     """
     Extract the first JSON object/array from a string and parse it into a Python object.
     Supports fenced code blocks like ```json ...``` or raw JSON embedded in text.
+    Applies heuristic repairs for common LLM JSON formatting errors.
 
     Args:
         raw: Raw LLM output text.
@@ -104,25 +155,24 @@ def extract_json(raw: str) -> Any:
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
     if match:
         candidate = match.group(1).strip()
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
+        result = _try_parse(candidate)
+        if result is not None:
+            return _normalize_strategy(result)
 
-    # Try matching the first { ... } or [ ... ]
+    # Try matching the first { ... } or [ ... ] (greedy — captures outermost)
     match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw)
     if match:
         candidate = match.group(1).strip()
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
+        result = _try_parse(candidate)
+        if result is not None:
+            return _normalize_strategy(result)
 
     # Fallback: attempt to parse the whole string
-    try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError:
-        raise ValueError(f"Failed to extract valid JSON from reply:\n{raw}")
+    result = _try_parse(raw.strip())
+    if result is not None:
+        return _normalize_strategy(result)
+
+    raise ValueError(f"Failed to extract valid JSON from reply:\n{raw}")
 
 def save_prompt_text(text: str, out_dir: Path, *, tag: str = "repair") -> Path:
     """

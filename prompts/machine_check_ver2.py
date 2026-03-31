@@ -1056,7 +1056,7 @@ def lookup_case(
 
 def run_machine_check(
     yaml_path: Path,
-    metric_csv_path: Path,
+    metric_csv_path: Optional[Path] = None,
     *,
     kernel_filter: Optional[str] = None,
     cuda_code: str = "",
@@ -1068,12 +1068,14 @@ def run_machine_check(
     kernel_launch_count: Optional[int] = None,  # Optional kernel launch count from nsys (overrides len(rows))
     io_dir: Optional[Path] = None,  # Optional directory to save judge_gate prompts and replies
     round_idx: Optional[int] = None,  # Optional round index for filename
+    profiling_mode: str = "ncu",  # "ncu" (default) | "timing_only" | "static"
+    kernel_duration_ns: Optional[float] = None,  # Used when profiling_mode != "ncu"
 ) -> Dict[str, Any]:
     """Run machine-check and return a diagnostic JSON-like dict.
     
     Args:
         yaml_path: Path to machine_check YAML rules
-        metric_csv_path: Path to NCU metrics CSV file
+        metric_csv_path: Path to NCU metrics CSV file (optional when profiling_mode != "ncu")
         kernel_filter: Optional kernel name filter
         cuda_code: Optional CUDA kernel code string
         arch_path: Optional PyTorch reference architecture path (for judge_gate LLM extraction)
@@ -1082,21 +1084,34 @@ def run_machine_check(
         call_llm: Optional LLM call function for judge_gate extraction (used when feature_mode="llm")
         aggregate: Whether to aggregate multiple kernel rows
         kernel_launch_count: Optional kernel launch count from nsys (overrides len(rows) calculation)
+        profiling_mode: "ncu" (default, full NCU metrics), "timing_only" (only timing data),
+                        or "static" (no runtime data at all — pure code analysis)
+        kernel_duration_ns: Kernel duration in nanoseconds (used when profiling_mode != "ncu")
     
     Returns:
         Dict containing tier, bottleneck_id, case_id, allowed_methods, code_features_used, etc.
     """
     rules = load_yaml_rules(yaml_path)
 
-    rows = read_metric_rows(metric_csv_path)
-    if not rows:
-        raise ValueError(f"No rows in CSV: {metric_csv_path}")
+    if profiling_mode in ("timing_only", "static"):
+        # --- No NCU CSV: build an empty metric row with only timing data ---
+        metric_row: Dict[str, str] = {}
+        kernel_launch_count_final = kernel_launch_count if kernel_launch_count is not None else 1
+        if kernel_duration_ns is not None:
+            metric_row["gpu__time_duration.avg"] = str(kernel_duration_ns)
+    else:
+        # --- Standard NCU path ---
+        if metric_csv_path is None:
+            raise ValueError("metric_csv_path is required when profiling_mode='ncu'")
+        rows = read_metric_rows(metric_csv_path)
+        if not rows:
+            raise ValueError(f"No rows in CSV: {metric_csv_path}")
 
-    # Determine kernel_launch_count: prioritize parameter (from nsys), fall back to len(rows) (from NCU)
-    kernel_launch_count_final = kernel_launch_count if kernel_launch_count is not None else len(rows)
+        # Determine kernel_launch_count: prioritize parameter (from nsys), fall back to len(rows) (from NCU)
+        kernel_launch_count_final = kernel_launch_count if kernel_launch_count is not None else len(rows)
 
-    krows = select_kernel_rows(rows, kernel_filter)
-    metric_row = aggregate_kernel_rows(krows) if aggregate else krows[0]
+        krows = select_kernel_rows(rows, kernel_filter)
+        metric_row = aggregate_kernel_rows(krows) if aggregate else krows[0]
 
     # code_features source
     if feature_mode == "manual":
