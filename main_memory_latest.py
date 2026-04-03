@@ -10,8 +10,9 @@ import importlib.util
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from run_ncu_memory import profile_bench, load_ncu_metrics, metrics_to_prompt
-from run_nsys import profile_bench as nsys_profile_bench, load_nsys_stats
+from run_torch_profile import profile_bench, load_ncu_metrics, metrics_to_prompt
+from run_torch_profile import profile_bench as nsys_profile_bench, load_nsys_stats
+import run_torch_profile as _rtp
 import matplotlib
 matplotlib.use("Agg")  # headless save
 import matplotlib.pyplot as plt
@@ -693,6 +694,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             raise FileNotFoundError(f"Template file {template_path} not found. Cannot create {bench_py}")
 
     call_llm = _make_llm_caller(args)
+    _rtp._GPU_NAME = args.gpu
 
     current_kernel: Optional[KernelIndividual] = None
     base_kernel: Optional[KernelIndividual] = None  # Base kernel for optimization (updated with strict conditions)

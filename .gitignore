@@ -4,3 +4,4 @@ run/
 *.csv
 *.nsys-rep
 *.sqlite
+run_*
