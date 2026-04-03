@@ -15,6 +15,7 @@ Key features
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -24,6 +25,7 @@ import signal
 import sys
 import tempfile
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -33,6 +35,18 @@ import torch
 # ---------------------------------------------------------------------------
 
 TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+_GPU_LOCK_FILE = "/tmp/kernelmem_gpu.lock"
+
+@contextmanager
+def _gpu_lock():
+    """Process-level mutex: only one GPU operation runs at a time."""
+    with open(_GPU_LOCK_FILE, "w") as _lf:
+        fcntl.flock(_lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(_lf, fcntl.LOCK_UN)
 
 # ---------------------------------------------------------------------------
 
@@ -507,6 +521,29 @@ def compare_and_bench(
     仅从 reference 脚本读取 get_init_inputs()，并对 ref/test 使用同一组初始化参数。
     同时：固定随机性 + 参数对齐（支持 Model→ModelNew 专用对齐 & 通用对齐）。
     """
+    import os
+    import contextlib
+    from datetime import datetime
+
+    with _gpu_lock():
+        return _compare_and_bench_inner(
+            ref_py, test_py,
+            device_idx=device_idx, warmup=warmup, repeat=repeat,
+            tol=tol, log_dir=log_dir, seed=seed,
+        )
+
+
+def _compare_and_bench_inner(
+    ref_py: Path,
+    test_py: Path,
+    *,
+    device_idx: int = 0,
+    warmup: int = 5,
+    repeat: int = 20,
+    tol: float = 1e-4,
+    log_dir: str | Path | None = "run/debug",
+    seed: int = 100,
+) -> dict:
     import os
     import contextlib
     from datetime import datetime

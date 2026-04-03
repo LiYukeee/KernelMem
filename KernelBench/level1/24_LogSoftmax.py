@@ -21,7 +21,7 @@ class Model(nn.Module):
         """
         return torch.log_softmax(x, dim=self.dim)
 
-batch_size = 4096
+batch_size = 1024
 dim = 393216
 
 def get_inputs():
