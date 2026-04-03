@@ -86,48 +86,114 @@ def save_kernel_code(code: str, out_dir: Path | str = "kernels") -> Path:
 
 
 def _repair_json_str(s: str) -> str:
-    """Apply a series of heuristic repairs to LLM-generated JSON strings.
+    """Apply heuristic repairs to LLM-generated JSON strings.
 
-    Handles common mistakes such as:
-    - Backslash-escaped outer quotes used as values: ``"key": \\"value\\"``
+    Handles:
+    - Backslash-escaped outer quotes: ``"key": \\"value\\"``
     - Trailing commas before ``}`` or ``]``
-    - List/object values that should be strings (joined with newline)
     """
     # 1. Unescape backslash-quoted values: "key": \"value\" → "key": "value"
-    #    This replaces \" that appear at JSON-value positions (after : or [ , )
-    #    with a plain " so the JSON becomes valid.
     s = re.sub(r'(?<=[:{,\[\s])\\"((?:[^"\\]|\\.)*)\\"\s*(?=[,}\]])',
                lambda m: '"' + m.group(1) + '"', s)
-
-    # 2. Remove trailing commas inside objects/arrays, which Python json rejects.
+    # 2. Remove trailing commas inside objects/arrays.
     s = re.sub(r',\s*([}\]])', r'\1', s)
-
     return s
 
 
+def _close_json(s: str) -> str:
+    """Add missing closing brackets/braces to a truncated JSON string.
+
+    Walks the string character-by-character (respecting string literals and
+    escape sequences) and appends whatever closing chars are needed.
+    """
+    stack: list = []
+    in_str = False
+    escape = False
+    for ch in s:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if not in_str:
+            if ch in '{[':
+                stack.append('}' if ch == '{' else ']')
+            elif ch in '}]' and stack and stack[-1] == ch:
+                stack.pop()
+    return s + ''.join(reversed(stack))
+
+
 def _try_parse(candidate: str):
-    """Try json.loads; on failure apply _repair_json_str and retry."""
+    """Try json.loads with three escalating repair strategies.
+
+    1. Direct parse
+    2. After _repair_json_str (unescape + trailing-comma removal)
+    3. After repair + truncation at the first error position + bracket closing
+
+    Returns the parsed Python object, or None if all strategies fail.
+    """
+    # Pass 1: direct
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
         pass
+
+    # Pass 2: after basic repair
+    repaired = _repair_json_str(candidate)
+    err_pos = len(repaired)
     try:
-        return json.loads(_repair_json_str(candidate))
+        return json.loads(repaired)
+    except json.JSONDecodeError as e:
+        err_pos = e.pos
+
+    # Pass 3: truncate at the error position, close any open brackets.
+    # This handles cases like arrays that contain bare "key": value pairs:
+    #   "__FIELD__": [{...}, "key": value]
+    # After truncation (dropping "key": value) the array + outer object close cleanly.
+    trunc = repaired[:err_pos].rstrip()
+    if trunc.endswith(','):
+        trunc = trunc[:-1].rstrip()
+    try:
+        return json.loads(_close_json(trunc))
     except json.JSONDecodeError:
         pass
+
     return None
 
 
 def _normalize_strategy(obj: Any) -> Any:
-    """Convert list/dict field values to plain strings where the prompt schema
-    expects strings (``modification plan``, ``evidence``,
-    ``expected_metric_change``).  Operates in-place and returns the obj."""
+    """Normalise a parsed strategy dict.
+
+    - Renames non-standard LLM keys (e.g. ``__EXPECTED_METRIC_CHANGE__``) to
+      the canonical names expected by the rest of the code.
+    - Converts list/dict field values to plain strings for fields where
+      the schema expects a string.
+    """
     if not isinstance(obj, dict):
         return obj
-    _list_fields = {"modification plan", "evidence", "expected_metric_change",
-                    "modification_plan", "primary_optimisation_method"}
-    for key, val in obj.items():
-        if key in _list_fields:
+
+    # Rename non-standard keys produced by some LLM responses
+    _aliases = {
+        "__EXPECTED_METRIC_CHANGE__": "expected_metric_change",
+        "modification_plan": "modification plan",
+    }
+    for old_key, new_key in _aliases.items():
+        if old_key in obj and new_key not in obj:
+            obj[new_key] = obj.pop(old_key)
+
+    # Stringify list/dict values for fields that expect a plain string
+    _flatten = {
+        "modification plan", "modification_plan",
+        "evidence", "expected_metric_change",
+        "primary_optimisation_method",
+    }
+    for key in list(obj.keys()):
+        if key in _flatten:
+            val = obj[key]
             if isinstance(val, list):
                 obj[key] = "\n".join(str(v) for v in val)
             elif isinstance(val, dict):

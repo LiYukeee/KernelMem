@@ -22,6 +22,7 @@ from prompts.generate_custom_cuda_memory import build_seed_prompt, default_syste
 from prompts.judger_compilation_timeout import build_compilation_timeout_prompts
 from utils.compile_and_run import compare_and_bench
 from utils.kernel_io import extract_code_block, save_kernel_code, extract_json, extract_cuda_kernel_names
+from utils.kernel_sanitizer import sanitize_kernel_code
 from scripts.individual import KernelIndividual  # adjust path if needed
 from prompts.error_memory import build_error_prompt
 from prompts.optimization_memory_latest import build_optimization_prompt
@@ -236,7 +237,11 @@ def _llm_to_kernel(
     else:
         # For other call types (seed, repair, etc.), use standard extraction
         code = extract_code_block(raw) or raw  # fallback
-    
+
+    # Apply sanitizer: fix LLM hallucinations in load_inline args, CUDA identifiers,
+    # and TORCH_LIBRARY + functions=[] double-registration conflict.
+    code = sanitize_kernel_code(code)
+
     path = save_kernel_code(code, code_dir)
     ind = KernelIndividual(code)
     ind.code_path = path  # type: ignore[attr-defined]
